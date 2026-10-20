@@ -51,6 +51,15 @@ struct FeathrDeskApp: App {
                 }
                 .keyboardShortcut("f", modifiers: .command)
             }
+            CommandMenu("Go") {
+                ForEach(Array(DeskSection.allCases.enumerated()), id: \.element) { index, section in
+                    Button(section.rawValue) { model.go(section) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+                }
+                Divider()
+                Button("Recent gifts") { model.showActivity(flavor: ActivityKind.donation.flavor) }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+            }
         }
     }
 }

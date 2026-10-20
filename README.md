@@ -54,6 +54,29 @@ Writes always show a confirm dialog first.
 - **Activity** — paginated breadcrumbs with **Load more**; donation amount/campaign only if Feathr included them
 - **Webhooks** — Salesforce sync pause / turn on
 
+## Read vs. write
+
+- Reads work with any valid key.
+- Writes need the matching scope on the key: `persons:write` (create/edit people), `tags:write` (create, rename, add or remove tags), `webhooks:write` (pause or turn on sync). Buttons stay disabled without the scope, and Desk shows which areas are read-only on the home screen.
+- Removing a tag sends `PATCH /persons/{id}` with the remaining tag ids, then re-reads the person. If Feathr kept the tag, Desk says so and you remove it in Feathr. As of the August 2026 write-access check, Feathr had not confirmed that tag removal works through the API.
+
+## Still done in Feathr
+
+- Building, starting, stopping, or sending campaigns (the API returned 405 for campaign and project writes)
+- Deleting tags or merging duplicate tags
+- Editing custom field values on a person (Desk shows them read-only)
+- Gift amounts and currency: donation breadcrumbs did not include them as of the last check, so amounts stay in the CSV export. Desk shows an amount only if Feathr includes one.
+- Pausing sync when the key lacks `webhooks:write`
+
+## Shortcuts
+
+| Keys | Action |
+|------|--------|
+| ⌘R | Refresh from Feathr (also reloads Activity when open) |
+| ⌘F | Jump to search (People, Tags, or Campaigns) |
+| ⌘1–⌘8 | Go to a section |
+| ⇧⌘G | Recent gifts |
+
 ## Version
 
 App version **1.1** (`DeskInfo.version` and `scripts/build-app.sh`).

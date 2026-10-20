@@ -326,8 +326,8 @@ enum Plain {
     /// Gift amount exactly as Feathr sent it. Empty when the breadcrumb has none.
     static func amount(_ crumb: [String: Any]) -> String {
         let data = JSON.object(crumb["data"])
-        let raw = firstDisplay(crumb, keys: ["amount", "donation_amount", "value", "gift_amount"])
-            .ifEmpty(firstDisplay(data, keys: ["amount", "donation_amount", "value", "gift_amount"]))
+        let keys = ["amount", "donation_amount", "gift_amount"]
+        let raw = firstDisplay(crumb, keys: keys).ifEmpty(firstDisplay(data, keys: keys))
         guard !raw.isEmpty else { return "" }
         let currency = JSON.display(crumb["currency"]).ifEmpty(JSON.display(data["currency"]))
         return currency.isEmpty ? raw : "\(raw) \(currency.uppercased())"
@@ -354,11 +354,15 @@ enum Plain {
 extension View {
     /// Focuses the field when Desk requests this section (⌘F / quick actions).
     func searchFocus(_ model: DeskModel, _ section: DeskSection, _ focused: FocusState<Bool>.Binding) -> some View {
-        onChange(of: model.focusRequest) { _, request in
-            guard request == section else { return }
-            focused.wrappedValue = true
-            model.focusRequest = nil
+        let take = {
+            guard model.focusRequest == section else { return }
+            DispatchQueue.main.async {
+                focused.wrappedValue = true
+                model.focusRequest = nil
+            }
         }
+        return onAppear { take() }
+            .onChange(of: model.focusRequest) { _, _ in take() }
     }
 }
 
