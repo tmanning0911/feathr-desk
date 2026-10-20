@@ -33,6 +33,24 @@ struct FeathrDeskApp: App {
         .defaultSize(width: 1180, height: 760)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .appInfo) {
+                Button("About Feathr Desk") {
+                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                        .applicationName: "Feathr Desk",
+                        .applicationVersion: DeskInfo.version,
+                    ])
+                }
+            }
+            CommandGroup(after: .toolbar) {
+                Button("Refresh Desk") {
+                    Task { await model.refreshAll() }
+                }
+                .keyboardShortcut("r", modifiers: .command)
+                Button("Find…") {
+                    model.requestFocus()
+                }
+                .keyboardShortcut("f", modifiers: .command)
+            }
         }
     }
 }

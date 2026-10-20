@@ -59,6 +59,12 @@ enum DeskSection: String, CaseIterable, Identifiable {
         case .webhooks: return "arrow.left.arrow.right"
         }
     }
+
+    var hasSearch: Bool { self == .people || self == .tags || self == .campaigns }
+}
+
+enum RowKind {
+    case person, crumb, campaign, webhook, tag, project, field, unknown
 }
 
 struct NoteLine: Identifiable {
@@ -75,8 +81,18 @@ struct PendingWrite: Identifiable {
     let run: () async -> Void
 }
 
+struct SyncHealth {
+    enum Level { case good, warning, problem, none }
+    var level: Level
+    var headline: String
+    var detail: String
+    var hook: [String: Any]?
+}
+
 @MainActor
 final class DeskModel: ObservableObject {
+    static let activityPageSize = 40
+
     @Published var section: DeskSection = .desk
     @Published var busy = false
     @Published var status = "Looking for the Feathr key."
@@ -87,18 +103,26 @@ final class DeskModel: ObservableObject {
     @Published var projects: [[String: Any]] = []
     @Published var fields: [[String: Any]] = []
     @Published var webhooks: [[String: Any]] = []
+    @Published var recentGifts: [[String: Any]] = []
+    @Published var lastRefresh: Date?
     @Published var crumbs: [[String: Any]] = []
     @Published var crumbTotal = 0
+    @Published var crumbPage = 0
+    @Published var loadingMore = false
     @Published var flavor = "donation"
     @Published var people: [[String: Any]] = []
     @Published var selected: [String: Any] = [:]
     @Published var notes: [NoteLine] = []
     @Published var pending: PendingWrite?
     @Published var errorText: String?
+    @Published var rate: RateSnapshot?
+    @Published var focusRequest: DeskSection?
 
     @Published var personQuery = ""
     @Published var tagQuery = ""
     @Published var campaignQuery = ""
+    @Published var campaignState = ""
+    @Published var campaignKind = ""
     @Published var newTagName = ""
     @Published var renameTag = ""
     @Published var draftFirst = ""
@@ -114,27 +138,46 @@ final class DeskModel: ObservableObject {
 
     private var api: FeathrAPI?
     private var base = "https://api.feathr.co"
+    private var activityGeneration = 0
+    private var activityLoadScheduled = false
 
     var scopes: [String] { JSON.strings(me["scopes"]) }
     var canWritePeople: Bool { scopes.contains("persons:write") }
     var canWriteTags: Bool { scopes.contains("tags:write") }
     var canWriteHooks: Bool { scopes.contains("webhooks:write") }
+    var connected: Bool { api != nil && !me.isEmpty }
 
     var serviceName: String { JSON.string(me["service_name"]).ifEmpty("Feathr") }
     var lastFour: String { JSON.string(me["last_four"]) }
+    var canLoadMoreActivity: Bool { !crumbs.isEmpty && crumbs.count < crumbTotal }
+
+    /// Rate limit from response headers, falling back to the `/me` payload.
+    var rateRemaining: Int? {
+        if let remaining = rate?.remaining { return remaining }
+        if let info = me["rate_limit"] as? [String: Any], info["remaining"] != nil { return JSON.int(info["remaining"]) }
+        return nil
+    }
+
+    var rateLimitedUntil: Date? {
+        guard let at = rate?.limitedAt else { return nil }
+        let until = at.addingTimeInterval(TimeInterval(rate?.retryAfter ?? 60))
+        return until > Date() ? until : nil
+    }
+
+    // MARK: - Boot and refresh
 
     func boot() async {
         if let stored = KeyStore.load() {
-            api = FeathrAPI(base: base, key: stored)
+            api = makeAPI(stored)
             keySource = "Keychain"
         } else if let env = KeyStore.readControlEnv() {
             base = env.base
             do {
                 try KeyStore.save(env.key)
-                api = FeathrAPI(base: base, key: env.key)
+                api = makeAPI(env.key)
                 keySource = "Feathr Control, saved to Keychain"
             } catch {
-                api = FeathrAPI(base: base, key: env.key)
+                api = makeAPI(env.key)
                 keySource = "Feathr Control .env"
             }
         } else {
@@ -147,12 +190,27 @@ final class DeskModel: ObservableObject {
     func replaceKey(_ raw: String) async {
         do {
             try KeyStore.save(raw)
-            api = FeathrAPI(base: base, key: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            api = makeAPI(raw.trimmingCharacters(in: .whitespacesAndNewlines))
             keySource = "Keychain"
+            rate = nil
             await refreshDesk()
         } catch {
             errorText = error.localizedDescription
         }
+    }
+
+    private func makeAPI(_ key: String) -> FeathrAPI {
+        var client = FeathrAPI(base: base, key: key)
+        client.onRate = { [weak self] snapshot in
+            Task { @MainActor in self?.rate = snapshot }
+        }
+        return client
+    }
+
+    /// Cmd+R: reload the reference lists, and the current activity list when on Activity.
+    func refreshAll() async {
+        await refreshDesk()
+        if section == .activity { await loadActivity() }
     }
 
     func refreshDesk() async {
@@ -172,34 +230,132 @@ final class DeskModel: ObservableObject {
             fields = try await fieldPage.items
             webhooks = try await hookPage.items
             status = "Connected"
+            lastRefresh = Date()
             note("Desk refreshed. \(tags.count) tags, \(campaigns.count) campaigns, \(projects.count) projects.")
             if selected.isEmpty == false {
                 reselect()
             }
         } catch {
             errorText = error.localizedDescription
-            status = "Feathr did not answer."
+            status = (error as? FeathrError)?.status == 401 ? "Feathr did not accept the key." : "Feathr did not answer."
+            return
+        }
+        if let gifts = try? await api.get("/breadcrumbs", query: ["flavor": "donation", "page": "1", "size": "5"]) {
+            recentGifts = JSON.array(gifts["items"])
         }
     }
 
+    // MARK: - Activity
+
     func loadActivity() async {
         guard let api else { return }
+        activityGeneration += 1
+        let generation = activityGeneration
         busy = true
-        defer { busy = false }
+        defer { if generation == activityGeneration { busy = false } }
         do {
-            var query = ["flavor": flavor]
-            if !activityPersonID.isEmpty {
-                query["person_id"] = activityPersonID
-            }
-            let page = try await api.get("/breadcrumbs", query: query.merging(["page": "1", "size": "40"]) { $1 })
+            let page = try await api.get("/breadcrumbs", query: activityQuery(page: 1))
+            guard generation == activityGeneration else { return }
             crumbs = JSON.array(page["items"])
             crumbTotal = JSON.int(page["total"])
+            crumbPage = 1
             let who = activityPersonLabel.isEmpty ? "the account" : activityPersonLabel
             note("Loaded \(ActivityKind.label(for: flavor).lowercased()) for \(who).")
+        } catch {
+            guard generation == activityGeneration else { return }
+            errorText = error.localizedDescription
+        }
+    }
+
+    func loadMoreActivity() async {
+        guard let api, canLoadMoreActivity, !loadingMore else { return }
+        let generation = activityGeneration
+        let next = crumbPage + 1
+        loadingMore = true
+        defer { loadingMore = false }
+        do {
+            let page = try await api.get("/breadcrumbs", query: activityQuery(page: next))
+            guard generation == activityGeneration else { return }
+            let batch = JSON.array(page["items"])
+            let known = Set(crumbs.map { JSON.string($0["id"]) })
+            crumbs.append(contentsOf: batch.filter { !known.contains(JSON.string($0["id"])) || JSON.string($0["id"]).isEmpty })
+            crumbTotal = JSON.int(page["total"])
+            crumbPage = next
+            if batch.isEmpty { crumbTotal = crumbs.count }
         } catch {
             errorText = error.localizedDescription
         }
     }
+
+    private func activityQuery(page: Int) -> [String: String] {
+        var query = ["flavor": flavor, "page": String(page), "size": String(Self.activityPageSize)]
+        if !activityPersonID.isEmpty { query["person_id"] = activityPersonID }
+        return query
+    }
+
+    /// Coalesces the several UI triggers for one user action into a single request.
+    func scheduleActivityLoad() {
+        guard !activityLoadScheduled else { return }
+        activityLoadScheduled = true
+        Task {
+            await Task.yield()
+            activityLoadScheduled = false
+            await loadActivity()
+        }
+    }
+
+    func showActivity(flavor: String, personID: String = "", label: String = "") {
+        self.flavor = flavor
+        activityPersonID = personID
+        activityPersonLabel = label
+        crumbs = []
+        crumbTotal = 0
+        crumbPage = 0
+        selected = [:]
+        section = .activity
+        scheduleActivityLoad()
+    }
+
+    /// Opens the person behind a breadcrumb or gift row in People.
+    func openPerson(from crumb: [String: Any]) async {
+        guard let api else { return }
+        let id = JSON.string(crumb["person_id"])
+        let email = JSON.string(crumb["email"]).lowercased()
+        busy = true
+        defer { busy = false }
+        do {
+            var person: [String: Any] = [:]
+            if !id.isEmpty {
+                person = try await api.get("/persons/\(id)")
+            } else if email.contains("@") {
+                let page = try await api.get("/persons", query: ["email": email, "page": "1", "size": "1"])
+                person = JSON.array(page["items"]).first ?? [:]
+            }
+            guard !person.isEmpty else {
+                errorText = "This activity is not linked to a person Feathr can find."
+                return
+            }
+            people = [person]
+            personQuery = JSON.string(person["email"]).ifEmpty(JSON.string(person["id"]))
+            section = .people
+            selected = person
+            fillDrafts()
+            note("Opened \(JSON.string(person["email"]).ifEmpty("person")) from activity.")
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    func personActivity(from crumb: [String: Any]) {
+        let id = JSON.string(crumb["person_id"])
+        guard !id.isEmpty else {
+            errorText = "This activity is not linked to a person id."
+            return
+        }
+        showActivity(flavor: flavor, personID: id, label: JSON.string(crumb["email"]).ifEmpty("this person"))
+    }
+
+    // MARK: - People
 
     func searchPeople() async {
         guard let api else { return }
@@ -221,6 +377,10 @@ final class DeskModel: ObservableObject {
             selected = people.first ?? [:]
             fillDrafts()
             note(people.isEmpty ? "No person for that search." : "Found \(people.count) person\(people.count == 1 ? "" : "s").")
+        } catch let error as FeathrError where error.status == 404 {
+            people = []
+            selected = [:]
+            note("No person with that id.")
         } catch {
             errorText = error.localizedDescription
         }
@@ -229,9 +389,26 @@ final class DeskModel: ObservableObject {
     func select(_ row: [String: Any]) {
         selected = row
         fillDrafts()
-        if JSON.string(row["context"]) == "person" || tags.contains(where: { JSON.string($0["id"]) == JSON.string(row["id"]) && JSON.string(row["name"]) == JSON.string($0["name"]) && row["email"] == nil && row["kind"] == nil && row["flavor"] == nil && row["collection"] == nil && row["target_url"] == nil }) {
+        if kind(of: row) == .tag {
             renameTag = JSON.string(row["name"])
         }
+    }
+
+    func kind(of row: [String: Any]) -> RowKind {
+        if row.isEmpty { return .unknown }
+        if row["flavor"] != nil { return .crumb }
+        let id = JSON.string(row["id"])
+        func listed(_ pool: [[String: Any]]) -> Bool { !id.isEmpty && pool.contains { JSON.string($0["id"]) == id } }
+        if listed(webhooks) || row["target_url"] != nil { return .webhook }
+        if listed(fields) || row["collection"] != nil { return .field }
+        if listed(campaigns) { return .campaign }
+        if listed(tags) { return .tag }
+        if listed(projects) { return .project }
+        if JSON.string(row["email"]).contains("@") || row["first_name"] != nil || row["custom_fields"] != nil { return .person }
+        if row["context"] != nil { return .tag }
+        if row["kind"] != nil { return .campaign }
+        if row["site_url"] != nil { return .project }
+        return .unknown
     }
 
     func confirm(_ title: String, _ detail: String, button: String, run: @escaping () async -> Void) {
@@ -263,15 +440,38 @@ final class DeskModel: ObservableObject {
 
     func applyTag() {
         guard let personID = selected["id"] as? String, !tagToApply.isEmpty, canWriteTags else { return }
-        let name = tags.first { JSON.string($0["id"]) == tagToApply }.map { JSON.string($0["name"]) } ?? tagToApply
-        confirm("Add \(name)?", "Tags \(JSON.string(selected["email"])).", button: "Add tag") {
-            await self.addTag(personID: personID, tagID: self.tagToApply)
+        let tagID = tagToApply
+        if JSON.tagIDs(selected).contains(tagID) {
+            errorText = "\(JSON.string(selected["email"])) already has \(tagName(tagID))."
+            return
+        }
+        confirm("Add \(tagName(tagID))?", "Tags \(JSON.string(selected["email"])).", button: "Add tag") {
+            await self.addTag(personID: personID, tagID: tagID)
         }
     }
+
+    func removeTag(_ tagID: String) {
+        guard let personID = selected["id"] as? String, canWriteTags, canWritePeople else { return }
+        let email = JSON.string(selected["email"])
+        let remaining = JSON.tagIDs(selected).filter { $0 != tagID }
+        confirm(
+            "Remove \(tagName(tagID))?",
+            "Takes the tag off \(email). The tag itself stays, and everyone else keeps it. The desk checks afterward that Feathr actually removed it.",
+            button: "Remove tag"
+        ) {
+            await self.removeTagNow(personID: personID, tagID: tagID, remaining: remaining)
+        }
+    }
+
+    // MARK: - Tags and webhooks
 
     func createTag() {
         let name = newTagName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, canWriteTags else { return }
+        if tags.contains(where: { JSON.string($0["name"]).caseInsensitiveCompare(name) == .orderedSame }) {
+            errorText = "A tag named “\(name)” already exists."
+            return
+        }
         confirm("Create “\(name)”?", "The tag starts empty. You add people to it afterward.", button: "Create tag") {
             await self.createTagNow(name)
         }
@@ -280,7 +480,7 @@ final class DeskModel: ObservableObject {
     func renameSelectedTag() {
         guard let id = selected["id"] as? String, canWriteTags else { return }
         let name = renameTag.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
+        guard !name.isEmpty, name != JSON.string(selected["name"]) else { return }
         confirm("Rename this tag?", "Everyone who has it keeps it. The new name is \(name).", button: "Rename") {
             await self.renameTagNow(id: id, name: name)
         }
@@ -297,6 +497,8 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    // MARK: - Lookups
+
     func tagName(_ id: String) -> String {
         tags.first { JSON.string($0["id"]) == id }.map { JSON.string($0["name"]) } ?? id
     }
@@ -306,16 +508,85 @@ final class DeskModel: ObservableObject {
         return projects.first { JSON.string($0["id"]) == id }.map { JSON.string($0["name"]) } ?? String(id.suffix(6))
     }
 
+    func campaignName(_ id: String) -> String {
+        guard !id.isEmpty else { return "" }
+        return campaigns.first { JSON.string($0["id"]) == id }.map { JSON.string($0["name"]) } ?? "Campaign …\(id.suffix(6))"
+    }
+
+    func fieldLabel(_ key: String) -> String {
+        fields.first { JSON.string($0["key"]) == key || JSON.string($0["id"]) == key }
+            .map { JSON.string($0["label"]).ifEmpty(key) } ?? key
+    }
+
+    /// Custom field values on a person, in label order. Only fields Feathr actually returned.
+    func customFieldRows(_ person: [String: Any]) -> [(label: String, value: String)] {
+        let values = JSON.object(person["custom_fields"])
+        return values.compactMap { key, value -> (String, String)? in
+            let text = JSON.display(value)
+            return text.isEmpty ? nil : (fieldLabel(key), text)
+        }
+        .sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
+    }
+
+    var campaignStates: [String] { Array(Set(campaigns.map { JSON.string($0["state"]) }.filter { !$0.isEmpty })).sorted() }
+    var campaignKinds: [String] { Array(Set(campaigns.map { JSON.string($0["kind"]) }.filter { !$0.isEmpty })).sorted() }
+
+    func campaignCount(state: String? = nil, kind: String? = nil) -> Int {
+        campaigns.filter { row in
+            (state == nil || JSON.string(row["state"]) == state) && (kind == nil || JSON.string(row["kind"]) == kind)
+        }.count
+    }
+
+    var filteredCampaigns: [[String: Any]] {
+        let q = campaignQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return campaigns
+            .filter { campaignState.isEmpty || JSON.string($0["state"]) == campaignState }
+            .filter { campaignKind.isEmpty || JSON.string($0["kind"]) == campaignKind }
+            .filter { q.isEmpty || JSON.string($0["name"]).lowercased().contains(q) || projectName(JSON.string($0["project_id"])).lowercased().contains(q) }
+            .sorted { JSON.string($0["name"]).localizedCaseInsensitiveCompare(JSON.string($1["name"])) == .orderedAscending }
+    }
+
+    var syncHealth: SyncHealth {
+        guard let hook = webhooks.first(where: { JSON.string($0["target_url"]).localizedCaseInsensitiveContains("salesforce") }) ?? webhooks.first else {
+            return SyncHealth(level: .none, headline: "No Salesforce sync link", detail: connected ? "Feathr has no webhook set up on this account, so people are not sent to Salesforce automatically." : "Connect a key to check sync.", hook: nil)
+        }
+        let active = JSON.bool(hook["is_active"]) == true
+        let streak = JSON.int(hook["consecutive_failures"])
+        let lastTry = JSON.string(hook["last_delivery_at"])
+        let when = lastTry.isEmpty ? "" : " Last attempt \(JSON.relative(lastTry))."
+        if !active {
+            let why = streak > 0 ? "It stopped after \(streak) deliveries in a row could not reach the website." : "People are not being sent to Salesforce right now."
+            return SyncHealth(level: .problem, headline: "Salesforce sync is paused", detail: why + when, hook: hook)
+        }
+        if streak > 0 {
+            return SyncHealth(level: .warning, headline: "Salesforce sync is on, but failing", detail: "The last \(streak) deliver\(streak == 1 ? "y" : "ies") could not reach the website.\(when)", hook: hook)
+        }
+        return SyncHealth(level: .good, headline: "Salesforce sync is on", detail: "New and updated people are being sent to Salesforce.\(when)", hook: hook)
+    }
+
+    func requestFocus(_ target: DeskSection? = nil) {
+        let destination = target ?? (section.hasSearch ? section : .people)
+        if section != destination {
+            section = destination
+            selected = [:]
+        }
+        focusRequest = destination
+    }
+
+    func go(_ destination: DeskSection) {
+        section = destination
+        selected = [:]
+    }
+
+    // MARK: - Writes
+
     private func writePerson(id: String, body: [String: Any]) async {
         guard let api else { return }
         busy = true
         defer { busy = false }
         do {
             let updated = try await api.send("PATCH", "/persons/\(id)", body: body)
-            selected = updated
-            if let index = people.firstIndex(where: { JSON.string($0["id"]) == id }) {
-                people[index] = updated
-            }
+            replacePerson(updated, id: id)
             fillDrafts()
             note("Saved person \(JSON.string(updated["email"])).")
         } catch {
@@ -354,11 +625,27 @@ final class DeskModel: ObservableObject {
         do {
             _ = try await api.send("POST", "/persons/\(personID)/tags", body: ["tag_ids": [tagID]])
             let updated = try await api.get("/persons/\(personID)")
-            selected = updated
-            if let index = people.firstIndex(where: { JSON.string($0["id"]) == personID }) {
-                people[index] = updated
-            }
+            replacePerson(updated, id: personID)
             note("Tagged \(JSON.string(updated["email"])) with \(tagName(tagID)).")
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
+
+    private func removeTagNow(personID: String, tagID: String, remaining: [String]) async {
+        guard let api else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            _ = try await api.send("PATCH", "/persons/\(personID)", body: ["tag_ids": remaining])
+            let updated = try await api.get("/persons/\(personID)")
+            replacePerson(updated, id: personID)
+            if JSON.tagIDs(updated).contains(tagID) {
+                errorText = "Feathr accepted the request but kept \(tagName(tagID)) on this person. The API may not support removing tags yet. Remove it in Feathr instead."
+                note("Tag \(tagName(tagID)) is still on \(JSON.string(updated["email"])).")
+            } else {
+                note("Removed \(tagName(tagID)) from \(JSON.string(updated["email"])).")
+            }
         } catch {
             errorText = error.localizedDescription
         }
@@ -418,11 +705,20 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    private func replacePerson(_ updated: [String: Any], id: String) {
+        if JSON.string(selected["id"]) == id {
+            selected = updated
+        }
+        if let index = people.firstIndex(where: { JSON.string($0["id"]) == id }) {
+            people[index] = updated
+        }
+    }
+
     private func fillDrafts() {
         draftFirst = JSON.string(selected["first_name"])
         draftLast = JSON.string(selected["last_name"])
         draftPhone = JSON.string(selected["phone"])
-        if tagToApply.isEmpty {
+        if tagToApply.isEmpty || !tags.contains(where: { JSON.string($0["id"]) == tagToApply }) {
             tagToApply = tags.first.map { JSON.string($0["id"]) } ?? ""
         }
     }
@@ -436,12 +732,8 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func note(_ text: String) {
+    func note(_ text: String) {
         notes.insert(NoteLine(time: Date(), text: text), at: 0)
         if notes.count > 40 { notes.removeLast(notes.count - 40) }
     }
-}
-
-private extension String {
-    func ifEmpty(_ fallback: String) -> String { isEmpty ? fallback : self }
 }

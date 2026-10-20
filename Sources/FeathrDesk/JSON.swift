@@ -67,4 +67,56 @@ enum JSON {
         formatter.timeStyle = .short
         return formatter.string(from: date)
     }
+
+    static func date(_ iso: String) -> Date? {
+        guard !iso.isEmpty else { return nil }
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return parser.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+    }
+
+    static func relative(_ iso: String) -> String {
+        guard let date = date(iso) else { return shortDate(iso) }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    /// Plain text for a scalar JSON value; empty for null, objects, and arrays of objects.
+    static func display(_ value: Any?) -> String {
+        switch value {
+        case nil, is NSNull: return ""
+        case let s as String: return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        case let n as NSNumber:
+            if CFGetTypeID(n) == CFBooleanGetTypeID() { return n.boolValue ? "Yes" : "No" }
+            return n.stringValue
+        case let list as [Any]:
+            return list.map { display($0) }.filter { !$0.isEmpty }.joined(separator: ", ")
+        default: return ""
+        }
+    }
+
+    /// Tag ids on a person. Feathr has returned both `tag_ids` and `tags` (ids or objects).
+    static func tagIDs(_ person: [String: Any]) -> [String] {
+        let ids = strings(person["tag_ids"])
+        if !ids.isEmpty { return ids }
+        if let list = person["tags"] as? [[String: Any]] {
+            return list.map { string($0["id"]) }.filter { !$0.isEmpty }
+        }
+        return strings(person["tags"])
+    }
+
+    static func personName(_ row: [String: Any]) -> String {
+        [string(row["first_name"]), string(row["last_name"])]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+}
+
+extension String {
+    func ifEmpty(_ fallback: String) -> String { isEmpty ? fallback : self }
+}
+
+extension Dictionary where Key == String, Value == Any {
+    var selfID: String { JSON.string(self["id"]).ifEmpty(JSON.string(self["key"])).ifEmpty(JSON.string(self["email"])) }
 }
