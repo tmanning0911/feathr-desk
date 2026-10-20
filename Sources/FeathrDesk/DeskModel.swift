@@ -30,8 +30,23 @@ enum ActivityKind: String, CaseIterable, Identifiable {
         }
     }
 
+    var symbol: String {
+        switch self {
+        case .donation: return "gift"
+        case .form: return "doc.text"
+        case .emailClick: return "envelope.open"
+        case .trackedClick: return "cursorarrow.click"
+        case .pageView: return "eye"
+        case .custom: return "sparkle"
+        }
+    }
+
     static func label(for flavor: String) -> String {
         allCases.first { $0.flavor == flavor }?.label ?? flavor.replacingOccurrences(of: "_", with: " ")
+    }
+
+    static func symbol(for flavor: String) -> String {
+        allCases.first { $0.flavor == flavor }?.symbol ?? "circle"
     }
 }
 
@@ -60,11 +75,26 @@ enum DeskSection: String, CaseIterable, Identifiable {
         }
     }
 
+    var shortcut: String {
+        let index = (Self.allCases.firstIndex(of: self) ?? 0) + 1
+        return "⌘\(index)"
+    }
+
     var hasSearch: Bool { self == .people || self == .tags || self == .campaigns }
 }
 
 enum RowKind {
     case person, crumb, campaign, webhook, tag, project, field, unknown
+}
+
+enum CampaignSort: String, CaseIterable, Identifiable {
+    case name = "Name"
+    case newest = "Newest start"
+    var id: String { rawValue }
+}
+
+enum DeskPhase {
+    case lookingForKey, noKey, connecting, connected, keyRejected, unreachable
 }
 
 struct NoteLine: Identifiable {
@@ -74,10 +104,16 @@ struct NoteLine: Identifiable {
 }
 
 struct PendingWrite: Identifiable {
+    enum Tone { case standard, caution }
+
     let id = UUID()
     let title: String
     let detail: String
     let button: String
+    var tone: Tone = .standard
+    var points: [String] = []
+    /// When set, the confirm button stays disabled until this statement is checked.
+    var acknowledge: String? = nil
     let run: () async -> Void
 }
 
@@ -87,16 +123,62 @@ struct SyncHealth {
     var headline: String
     var detail: String
     var hook: [String: Any]?
+
+    static func of(_ hook: [String: Any]) -> SyncHealth {
+        let name = Plain.hookTitle(hook)
+        let destination = Plain.destination(hook)
+        let active = JSON.bool(hook["is_active"]) == true
+        let streak = JSON.int(hook["consecutive_failures"])
+        let lastTry = JSON.string(hook["last_delivery_at"])
+        let when = lastTry.isEmpty ? "" : " Last attempt \(Human.relative(lastTry))."
+        let problem = Plain.hookProblem(JSON.string(hook["last_error"]))?.summary
+        if !active {
+            let why = streak > 0
+                ? "It stopped after \(Human.plural(streak, "delivery", "deliveries")) in a row could not reach \(destination)."
+                : "People are not being sent to \(destination) right now."
+            return SyncHealth(level: .problem, headline: "\(name) is paused", detail: why + when, hook: hook)
+        }
+        if streak > 0 {
+            let reason = problem.map { " \($0)" } ?? ""
+            return SyncHealth(level: .warning, headline: "\(name) is on, but failing", detail: "The last \(Human.plural(streak, "delivery", "deliveries")) did not go through.\(reason)\(when)", hook: hook)
+        }
+        return SyncHealth(level: .good, headline: "\(name) is on", detail: "New and updated people are being sent to \(destination).\(when)", hook: hook)
+    }
+}
+
+struct NextAction: Identifiable {
+    let id: String
+    let symbol: String
+    let title: String
+    let detail: String
+    var level: SyncHealth.Level = .none
+    let run: @MainActor () -> Void
 }
 
 @MainActor
 final class DeskModel: ObservableObject {
     static let activityPageSize = 40
+    static let recentGiftCount = 6
 
-    @Published var section: DeskSection = .desk
-    @Published var busy = false
-    @Published var status = "Looking for the Feathr key."
+    private enum Keys {
+        static let lastSection = "FeathrDesk.lastSection"
+        static let cleanExit = "FeathrDesk.cleanExit"
+        static let sidebar = "FeathrDesk.sidebarCollapsed"
+    }
+
+    nonisolated static func markCleanExit() {
+        UserDefaults.standard.set(true, forKey: Keys.cleanExit)
+    }
+
+    // MARK: - Published state
+
+    @Published var section: DeskSection = .desk {
+        didSet { sectionChanged(from: oldValue) }
+    }
+    @Published private(set) var inFlight = 0
+    @Published var phase: DeskPhase = .lookingForKey
     @Published var keySource = ""
+    @Published var keychainWaiting = false
     @Published var me: [String: Any] = [:]
     @Published var tags: [[String: Any]] = []
     @Published var campaigns: [[String: Any]] = []
@@ -104,25 +186,57 @@ final class DeskModel: ObservableObject {
     @Published var fields: [[String: Any]] = []
     @Published var webhooks: [[String: Any]] = []
     @Published var recentGifts: [[String: Any]] = []
+    @Published var giftTotal: Int?
+    @Published var peopleOnAccount: Int?
+    @Published var listProblems: [String] = []
     @Published var lastRefresh: Date?
+    @Published var refreshing = false
+
     @Published var crumbs: [[String: Any]] = []
-    @Published var crumbTotal = 0
+    @Published var crumbTotal: Int?
     @Published var crumbPage = 0
+    @Published var crumbHasMore = false
+    @Published var activityLoading = false
+    @Published var activityLoadedOnce = false
     @Published var loadingMore = false
+    @Published var activityError: String?
+    @Published var loadMoreError: String?
     @Published var flavor = "donation"
+    @Published var flavorCounts: [String: Int] = [:]
+    @Published var activityPersonID = ""
+    @Published var activityPersonLabel = ""
+
     @Published var people: [[String: Any]] = []
+    @Published var peopleMatchTotal: Int?
+    @Published var peopleQueryRan = ""
+    @Published var peopleSearching = false
+    @Published var peopleHint: String?
+    @Published var recentPeople: [[String: Any]] = []
+
     @Published var selected: [String: Any] = [:]
     @Published var notes: [NoteLine] = []
     @Published var pending: PendingWrite?
     @Published var errorText: String?
     @Published var rate: RateSnapshot?
     @Published var focusRequest: DeskSection?
+    @Published var showKeySheet = false
+    @Published var showCreatePerson = false
+
+    @Published var paletteOpen = false
+    @Published var paletteQuery = "" { didSet { paletteIndex = 0 } }
+    @Published var paletteIndex = 0
+
+    @Published var sidebarCollapsed = false {
+        didSet { UserDefaults.standard.set(sidebarCollapsed, forKey: Keys.sidebar) }
+    }
 
     @Published var personQuery = ""
     @Published var tagQuery = ""
     @Published var campaignQuery = ""
     @Published var campaignState = ""
     @Published var campaignKind = ""
+    @Published var campaignProject = ""
+    @Published var campaignSort: CampaignSort = .name
     @Published var newTagName = ""
     @Published var renameTag = ""
     @Published var draftFirst = ""
@@ -133,29 +247,73 @@ final class DeskModel: ObservableObject {
     @Published var createLast = ""
     @Published var createPhone = ""
     @Published var tagToApply = ""
-    @Published var activityPersonID = ""
-    @Published var activityPersonLabel = ""
 
     private var api: FeathrAPI?
     private var base = "https://api.feathr.co"
     private var activityGeneration = 0
-    private var activityLoadScheduled = false
+    private var peopleGeneration = 0
+    private var countsScope: String?
+    private var sectionTasks: [String: Task<Void, Never>] = [:]
+    private var history: [DeskSection] = []
+    private var navigatingBack = false
+    private var restoreSection: DeskSection?
 
+    init() {
+        let defaults = UserDefaults.standard
+        sidebarCollapsed = defaults.bool(forKey: Keys.sidebar)
+        let clean = defaults.object(forKey: Keys.cleanExit) as? Bool ?? true
+        if clean, let raw = defaults.string(forKey: Keys.lastSection), let last = DeskSection(rawValue: raw) {
+            restoreSection = last
+        }
+        defaults.set(false, forKey: Keys.cleanExit)
+    }
+
+    // MARK: - Derived state
+
+    var busy: Bool { inFlight > 0 }
     var scopes: [String] { JSON.strings(me["scopes"]) }
     var canWritePeople: Bool { scopes.contains("persons:write") }
     var canWriteTags: Bool { scopes.contains("tags:write") }
     var canWriteHooks: Bool { scopes.contains("webhooks:write") }
     var connected: Bool { api != nil && !me.isEmpty }
+    var hasKey: Bool { api != nil }
+    var canGoBack: Bool { !history.isEmpty }
 
     var serviceName: String { JSON.string(me["service_name"]).ifEmpty("Feathr") }
     var lastFour: String { JSON.string(me["last_four"]) }
-    var canLoadMoreActivity: Bool { !crumbs.isEmpty && crumbs.count < crumbTotal }
+    var canLoadMoreActivity: Bool { !crumbs.isEmpty && crumbHasMore }
+
+    var status: String {
+        switch phase {
+        case .lookingForKey:
+            return keychainWaiting
+                ? "Waiting for Keychain access. Choose Always Allow so Desk can read the Feathr key."
+                : "Looking for the Feathr key."
+        case .noKey: return "No Feathr key yet."
+        case .connecting: return "Connecting to Feathr…"
+        case .connected: return "Connected"
+        case .keyRejected: return "Feathr did not accept the key."
+        case .unreachable: return "Feathr did not answer."
+        }
+    }
 
     /// Rate limit from response headers, falling back to the `/me` payload.
     var rateRemaining: Int? {
         if let remaining = rate?.remaining { return remaining }
         if let info = me["rate_limit"] as? [String: Any], info["remaining"] != nil { return JSON.int(info["remaining"]) }
         return nil
+    }
+
+    var rateLimit: Int? {
+        if let limit = rate?.limit { return limit }
+        if let info = me["rate_limit"] as? [String: Any], info["limit"] != nil { return JSON.int(info["limit"]) }
+        return nil
+    }
+
+    var rateLow: Bool {
+        guard let remaining = rateRemaining else { return false }
+        if let limit = rateLimit, limit > 0 { return Double(remaining) / Double(limit) < 0.15 }
+        return remaining < 50
     }
 
     var rateLimitedUntil: Date? {
@@ -167,7 +325,14 @@ final class DeskModel: ObservableObject {
     // MARK: - Boot and refresh
 
     func boot() async {
-        if let stored = KeyStore.load() {
+        let waiting = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if !Task.isCancelled { self?.keychainWaiting = true }
+        }
+        let stored = await Task.detached(priority: .userInitiated) { KeyStore.load() }.value
+        waiting.cancel()
+        keychainWaiting = false
+        if let stored {
             api = makeAPI(stored)
             keySource = "Keychain"
         } else if let env = KeyStore.readControlEnv() {
@@ -181,8 +346,13 @@ final class DeskModel: ObservableObject {
                 keySource = "Feathr Control .env"
             }
         } else {
-            status = "No Feathr key yet."
+            phase = .noKey
             return
+        }
+        if let last = restoreSection, last != .desk {
+            restoreSection = nil
+            section = last
+            if last.hasSearch { focusRequest = last }
         }
         await refreshDesk()
     }
@@ -193,9 +363,9 @@ final class DeskModel: ObservableObject {
             api = makeAPI(raw.trimmingCharacters(in: .whitespacesAndNewlines))
             keySource = "Keychain"
             rate = nil
-            await refreshDesk()
+            await refreshAll()
         } catch {
-            errorText = error.localizedDescription
+            report(error)
         }
     }
 
@@ -207,83 +377,250 @@ final class DeskModel: ObservableObject {
         return client
     }
 
-    /// Cmd+R: reload the reference lists, and the current activity list when on Activity.
+    /// ⌘R: reload reference lists, the open person, and the open activity list.
     func refreshAll() async {
+        if let until = rateLimitedUntil {
+            errorText = "Feathr asked Desk to slow down. Refresh opens up \(Human.relative(until))."
+            return
+        }
         await refreshDesk()
-        if section == .activity { await loadActivity() }
+        guard connected else { return }
+        if section == .activity {
+            loadActivity(forceCounts: true)
+        }
+        if section == .people, kind(of: selected) == .person, let id = selected["id"] as? String, let api {
+            await working {
+                if let fresh = try? await api.get("/persons/\(id)") { replacePerson(fresh, id: id) }
+            }
+        }
     }
 
     func refreshDesk() async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            me = try await api.get("/me")
-            async let tagPage = api.paginate("/tags")
-            async let campaignPage = api.paginate("/campaigns")
-            async let projectPage = api.paginate("/projects")
-            async let fieldPage = api.paginate("/custom-fields")
-            async let hookPage = api.paginate("/webhooks", pageSize: 50, maxPages: 2)
-            tags = try await tagPage.items
-            campaigns = try await campaignPage.items
-            projects = try await projectPage.items
-            fields = try await fieldPage.items
-            webhooks = try await hookPage.items
-            status = "Connected"
-            lastRefresh = Date()
-            note("Desk refreshed. \(tags.count) tags, \(campaigns.count) campaigns, \(projects.count) projects.")
-            if selected.isEmpty == false {
-                reselect()
+        refreshing = true
+        defer { refreshing = false }
+        if me.isEmpty { phase = .connecting }
+        await working {
+            do {
+                me = try await api.get("/me")
+            } catch {
+                if let feathr = error as? FeathrError, feathr.isCancelled { return }
+                phase = (error as? FeathrError)?.status == 401 ? .keyRejected : .unreachable
+                report(error)
+                return
             }
+            phase = .connected
+
+            async let tagResult = Self.list(api, "/tags")
+            async let campaignResult = Self.list(api, "/campaigns")
+            async let projectResult = Self.list(api, "/projects")
+            async let fieldResult = Self.list(api, "/custom-fields")
+            async let hookResult = Self.list(api, "/webhooks", pageSize: 50, maxPages: 2)
+            async let giftPage = try? api.get("/breadcrumbs", query: ["flavor": "donation", "page": "1", "size": String(Self.recentGiftCount)])
+            async let peoplePage = try? api.get("/persons", query: ["page": "1", "size": "1"])
+
+            var problems: [String] = []
+            func take(_ result: Result<[[String: Any]], Error>, _ label: String) -> [[String: Any]]? {
+                switch result {
+                case .success(let items): return items
+                case .failure(let error):
+                    if (error as? FeathrError)?.isCancelled != true { problems.append("\(label): \(Self.shortReason(error))") }
+                    return nil
+                }
+            }
+            if let rows = take(await tagResult, "Tags") { tags = Self.byName(rows) }
+            if let rows = take(await campaignResult, "Campaigns") { campaigns = rows }
+            if let rows = take(await projectResult, "Projects") { projects = Self.byName(rows) }
+            if let rows = take(await fieldResult, "Custom fields") { fields = rows }
+            if let rows = take(await hookResult, "Webhooks") { webhooks = rows }
+            if let gifts = await giftPage {
+                recentGifts = JSON.array(gifts["items"])
+                giftTotal = gifts["total"] == nil ? nil : JSON.int(gifts["total"])
+            }
+            if let page = await peoplePage, page["total"] != nil {
+                peopleOnAccount = JSON.int(page["total"])
+            }
+            listProblems = problems
+            lastRefresh = Date()
+            if problems.isEmpty {
+                note("Desk refreshed. \(Human.plural(tags.count, "tag")), \(Human.plural(campaigns.count, "campaign")), \(Human.plural(projects.count, "project")).")
+            } else {
+                note("Desk refreshed, but some lists did not load: \(problems.joined(separator: "; ")).")
+            }
+            if !selected.isEmpty { reselect() }
+            if tagToApply.isEmpty { tagToApply = tags.first.map { JSON.string($0["id"]) } ?? "" }
+        }
+        if connected, section == .activity, crumbs.isEmpty, !activityLoading {
+            loadActivity()
+        }
+    }
+
+    nonisolated private static func list(_ api: FeathrAPI, _ path: String, pageSize: Int = 100, maxPages: Int = 30) async -> Result<[[String: Any]], Error> {
+        do {
+            return .success(try await api.paginate(path, pageSize: pageSize, maxPages: maxPages).items)
         } catch {
-            errorText = error.localizedDescription
-            status = (error as? FeathrError)?.status == 401 ? "Feathr did not accept the key." : "Feathr did not answer."
-            return
+            return .failure(error)
         }
-        if let gifts = try? await api.get("/breadcrumbs", query: ["flavor": "donation", "page": "1", "size": "5"]) {
-            recentGifts = JSON.array(gifts["items"])
+    }
+
+    nonisolated private static func shortReason(_ error: Error) -> String {
+        switch (error as? FeathrError)?.status {
+        case 401: return "the key was not accepted"
+        case 403: return "this key cannot read them"
+        case 429: return "Feathr asked Desk to slow down"
+        default: return "Feathr did not answer"
         }
+    }
+
+    private static func byName(_ rows: [[String: Any]]) -> [[String: Any]] {
+        rows.sorted { JSON.string($0["name"]).localizedCaseInsensitiveCompare(JSON.string($1["name"])) == .orderedAscending }
+    }
+
+    // MARK: - Section work
+
+    private func sectionChanged(from old: DeskSection) {
+        guard old != section else { return }
+        cancelSectionWork()
+        if navigatingBack {
+            navigatingBack = false
+        } else {
+            history.append(old)
+            if history.count > 30 { history.removeFirst(history.count - 30) }
+        }
+        UserDefaults.standard.set(section.rawValue, forKey: Keys.lastSection)
+        if section == .activity, crumbs.isEmpty, connected {
+            loadActivity()
+        }
+    }
+
+    /// Runs work that belongs to the open section. Moving to another section cancels it, request and all.
+    private func launch(_ key: String, _ body: @escaping @MainActor () async -> Void) {
+        sectionTasks[key]?.cancel()
+        sectionTasks[key] = Task { @MainActor in await body() }
+    }
+
+    private func cancelSectionWork() {
+        sectionTasks.values.forEach { $0.cancel() }
+        sectionTasks.removeAll()
+    }
+
+    private func working(_ body: () async -> Void) async {
+        inFlight += 1
+        defer { inFlight -= 1 }
+        await body()
+    }
+
+    func report(_ error: Error) {
+        if let feathr = error as? FeathrError {
+            if feathr.isCancelled { return }
+            if feathr.status == 401 {
+                phase = .keyRejected
+                return
+            }
+        }
+        if error is CancellationError { return }
+        errorText = FeathrAPI.scrub(error.localizedDescription)
     }
 
     // MARK: - Activity
 
-    func loadActivity() async {
-        guard let api else { return }
+    func loadActivity(forceCounts: Bool = false) {
         activityGeneration += 1
         let generation = activityGeneration
-        busy = true
-        defer { if generation == activityGeneration { busy = false } }
-        do {
-            let page = try await api.get("/breadcrumbs", query: activityQuery(page: 1))
-            guard generation == activityGeneration else { return }
-            crumbs = JSON.array(page["items"])
-            crumbTotal = JSON.int(page["total"])
-            crumbPage = 1
-            let who = activityPersonLabel.isEmpty ? "the account" : activityPersonLabel
-            note("Loaded \(ActivityKind.label(for: flavor).lowercased()) for \(who).")
-        } catch {
-            guard generation == activityGeneration else { return }
-            errorText = error.localizedDescription
+        activityError = nil
+        loadMoreError = nil
+        activityLoading = true
+        launch("activity") { [self] in
+            defer { if generation == activityGeneration { activityLoading = false } }
+            guard let api else { return }
+            await working {
+                do {
+                    let page = try await api.get("/breadcrumbs", query: activityQuery(page: 1))
+                    guard generation == activityGeneration else { return }
+                    let batch = JSON.array(page["items"])
+                    crumbs = batch
+                    crumbPage = 1
+                    crumbTotal = page["total"] == nil ? nil : JSON.int(page["total"])
+                    crumbHasMore = Self.hasMore(loaded: batch.count, batch: batch.count, total: crumbTotal)
+                    activityLoadedOnce = true
+                    let who = activityPersonLabel.isEmpty ? "the account" : activityPersonLabel
+                    note("Loaded \(ActivityKind.label(for: flavor).lowercased()) for \(who).")
+                } catch {
+                    guard generation == activityGeneration, (error as? FeathrError)?.isCancelled != true else { return }
+                    if (error as? FeathrError)?.status == 401 { phase = .keyRejected }
+                    activityError = FeathrAPI.scrub(error.localizedDescription)
+                }
+            }
         }
+        loadActivityCounts(force: forceCounts)
     }
 
-    func loadMoreActivity() async {
-        guard let api, canLoadMoreActivity, !loadingMore else { return }
+    func loadMoreActivity() {
+        guard canLoadMoreActivity, !loadingMore else { return }
         let generation = activityGeneration
         let next = crumbPage + 1
         loadingMore = true
-        defer { loadingMore = false }
-        do {
-            let page = try await api.get("/breadcrumbs", query: activityQuery(page: next))
-            guard generation == activityGeneration else { return }
-            let batch = JSON.array(page["items"])
-            let known = Set(crumbs.map { JSON.string($0["id"]) })
-            crumbs.append(contentsOf: batch.filter { !known.contains(JSON.string($0["id"])) || JSON.string($0["id"]).isEmpty })
-            crumbTotal = JSON.int(page["total"])
-            crumbPage = next
-            if batch.isEmpty { crumbTotal = crumbs.count }
-        } catch {
-            errorText = error.localizedDescription
+        loadMoreError = nil
+        launch("activityMore") { [self] in
+            defer { if generation == activityGeneration { loadingMore = false } }
+            guard let api else { return }
+            await working {
+                do {
+                    let page = try await api.get("/breadcrumbs", query: activityQuery(page: next))
+                    guard generation == activityGeneration else { return }
+                    let batch = JSON.array(page["items"])
+                    let known = Set(crumbs.map { JSON.string($0["id"]) }.filter { !$0.isEmpty })
+                    let fresh = batch.filter { row in
+                        let id = JSON.string(row["id"])
+                        return id.isEmpty || !known.contains(id)
+                    }
+                    crumbs.append(contentsOf: fresh)
+                    crumbPage = next
+                    if page["total"] != nil { crumbTotal = JSON.int(page["total"]) }
+                    // A page of nothing but repeats means Feathr's list shifted; stop rather than loop.
+                    crumbHasMore = !fresh.isEmpty && Self.hasMore(loaded: crumbs.count, batch: batch.count, total: crumbTotal)
+                } catch {
+                    guard generation == activityGeneration, (error as? FeathrError)?.isCancelled != true else { return }
+                    loadMoreError = FeathrAPI.scrub(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private static func hasMore(loaded: Int, batch: Int, total: Int?) -> Bool {
+        if let total { return loaded < total && batch > 0 }
+        return batch >= activityPageSize
+    }
+
+    /// Totals per flavor for the current scope. Only shown when Feathr reports a total.
+    private func loadActivityCounts(force: Bool) {
+        let scope = activityPersonID
+        guard force || countsScope != scope else { return }
+        countsScope = scope
+        flavorCounts = [:]
+        launch("counts") { [self] in
+            guard let api else { return }
+            let results = await withTaskGroup(of: (String, Int?).self) { group -> [(String, Int?)] in
+                for kind in ActivityKind.allCases {
+                    var query = ["flavor": kind.flavor, "page": "1", "size": "1"]
+                    if !scope.isEmpty { query["person_id"] = scope }
+                    group.addTask {
+                        guard let page = try? await api.get("/breadcrumbs", query: query), page["total"] != nil else { return (kind.flavor, nil) }
+                        return (kind.flavor, JSON.int(page["total"]))
+                    }
+                }
+                var collected: [(String, Int?)] = []
+                for await pair in group { collected.append(pair) }
+                return collected
+            }
+            if Task.isCancelled {
+                if countsScope == scope { countsScope = nil }
+                return
+            }
+            guard countsScope == scope else { return }
+            for (key, value) in results {
+                if let value { flavorCounts[key] = value }
+            }
         }
     }
 
@@ -293,27 +630,43 @@ final class DeskModel: ObservableObject {
         return query
     }
 
-    /// Coalesces the several UI triggers for one user action into a single request.
-    func scheduleActivityLoad() {
-        guard !activityLoadScheduled else { return }
-        activityLoadScheduled = true
-        Task {
-            await Task.yield()
-            activityLoadScheduled = false
-            await loadActivity()
-        }
+    private func resetActivity() {
+        activityGeneration += 1
+        crumbs = []
+        crumbTotal = nil
+        crumbPage = 0
+        crumbHasMore = false
+        activityError = nil
+        loadMoreError = nil
+        activityLoadedOnce = false
+        if kind(of: selected) == .crumb { selected = [:] }
+    }
+
+    func setFlavor(_ next: String) {
+        guard next != flavor || crumbs.isEmpty else { return }
+        flavor = next
+        resetActivity()
+        loadActivity()
+    }
+
+    func clearActivityPerson() {
+        activityPersonID = ""
+        activityPersonLabel = ""
+        resetActivity()
+        loadActivity()
     }
 
     func showActivity(flavor: String, personID: String = "", label: String = "") {
         self.flavor = flavor
         activityPersonID = personID
         activityPersonLabel = label
-        crumbs = []
-        crumbTotal = 0
-        crumbPage = 0
+        resetActivity()
         selected = [:]
-        section = .activity
-        scheduleActivityLoad()
+        if section == .activity {
+            loadActivity()
+        } else {
+            section = .activity
+        }
     }
 
     /// Opens the person behind a breadcrumb or gift row in People.
@@ -321,28 +674,30 @@ final class DeskModel: ObservableObject {
         guard let api else { return }
         let id = JSON.string(crumb["person_id"])
         let email = JSON.string(crumb["email"]).lowercased()
-        busy = true
-        defer { busy = false }
-        do {
-            var person: [String: Any] = [:]
-            if !id.isEmpty {
-                person = try await api.get("/persons/\(id)")
-            } else if email.contains("@") {
-                let page = try await api.get("/persons", query: ["email": email, "page": "1", "size": "1"])
-                person = JSON.array(page["items"]).first ?? [:]
+        await working {
+            do {
+                var person: [String: Any] = [:]
+                if !id.isEmpty {
+                    person = try await api.get("/persons/\(id)")
+                } else if email.contains("@") {
+                    let page = try await api.get("/persons", query: ["email": email, "page": "1", "size": "1"])
+                    person = JSON.array(page["items"]).first ?? [:]
+                }
+                guard !person.isEmpty else {
+                    errorText = "This activity is not linked to a person Feathr can find."
+                    return
+                }
+                people = [person]
+                peopleMatchTotal = 1
+                peopleHint = nil
+                personQuery = JSON.string(person["email"]).ifEmpty(JSON.string(person["id"]))
+                peopleQueryRan = personQuery
+                section = .people
+                select(person)
+                note("Opened \(JSON.string(person["email"]).ifEmpty("person")) from activity.")
+            } catch {
+                report(error)
             }
-            guard !person.isEmpty else {
-                errorText = "This activity is not linked to a person Feathr can find."
-                return
-            }
-            people = [person]
-            personQuery = JSON.string(person["email"]).ifEmpty(JSON.string(person["id"]))
-            section = .people
-            selected = person
-            fillDrafts()
-            note("Opened \(JSON.string(person["email"]).ifEmpty("person")) from activity.")
-        } catch {
-            errorText = error.localizedDescription
         }
     }
 
@@ -357,41 +712,85 @@ final class DeskModel: ObservableObject {
 
     // MARK: - People
 
-    func searchPeople() async {
-        guard let api else { return }
+    static func looksLikeID(_ text: String) -> Bool {
+        text.count >= 20 && !text.contains(" ") && !text.contains("@")
+    }
+
+    func searchPeople() {
         let query = personQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            if query.contains("@") {
-                let page = try await api.get("/persons", query: ["email": query.lowercased(), "page": "1", "size": "10"])
-                people = JSON.array(page["items"])
-            } else if query.count >= 20 {
-                let person = try await api.get("/persons/\(query)")
-                people = [person]
-            } else {
-                errorText = "Search with an email, or paste a person id."
-                return
-            }
-            selected = people.first ?? [:]
-            fillDrafts()
-            note(people.isEmpty ? "No person for that search." : "Found \(people.count) person\(people.count == 1 ? "" : "s").")
-        } catch let error as FeathrError where error.status == 404 {
-            people = []
-            selected = [:]
-            note("No person with that id.")
-        } catch {
-            errorText = error.localizedDescription
+        let byEmail = query.contains("@")
+        guard byEmail || Self.looksLikeID(query) else {
+            peopleHint = "Desk looks people up by the full email they used, or by a Feathr person id."
+            return
         }
+        peopleHint = nil
+        peopleGeneration += 1
+        let generation = peopleGeneration
+        peopleSearching = true
+        selected = [:]
+        launch("people") { [self] in
+            defer { if generation == peopleGeneration { peopleSearching = false } }
+            guard let api else { return }
+            await working {
+                do {
+                    if byEmail {
+                        let page = try await api.get("/persons", query: ["email": query.lowercased(), "page": "1", "size": "10"])
+                        guard generation == peopleGeneration else { return }
+                        people = JSON.array(page["items"])
+                        peopleMatchTotal = page["total"] == nil ? people.count : JSON.int(page["total"])
+                    } else {
+                        let person = try await api.get("/persons/\(query)")
+                        guard generation == peopleGeneration else { return }
+                        people = [person]
+                        peopleMatchTotal = 1
+                    }
+                    peopleQueryRan = query
+                    if people.count == 1, let only = people.first { select(only) }
+                    switch people.count {
+                    case 0: note("No person for \(query).")
+                    case 1: note("Found \(JSON.string(people[0]["email"]).ifEmpty("one person")).")
+                    default: note("\(people.count) people share \(query).")
+                    }
+                } catch let error as FeathrError where error.status == 404 {
+                    guard generation == peopleGeneration else { return }
+                    people = []
+                    peopleMatchTotal = 0
+                    peopleQueryRan = query
+                    note("No person with that id.")
+                } catch {
+                    guard generation == peopleGeneration else { return }
+                    report(error)
+                }
+            }
+        }
+    }
+
+    func startCreate(withEmail email: String) {
+        draftEmail = email
+        showCreatePerson = true
     }
 
     func select(_ row: [String: Any]) {
         selected = row
         fillDrafts()
-        if kind(of: row) == .tag {
-            renameTag = JSON.string(row["name"])
+        switch kind(of: row) {
+        case .tag: renameTag = JSON.string(row["name"])
+        case .person: remember(row)
+        default: break
         }
+    }
+
+    func clearSelection() {
+        selected = [:]
+    }
+
+    private func remember(_ person: [String: Any]) {
+        let id = JSON.string(person["id"])
+        guard !id.isEmpty else { return }
+        recentPeople.removeAll { JSON.string($0["id"]) == id }
+        recentPeople.insert(person, at: 0)
+        if recentPeople.count > 8 { recentPeople.removeLast(recentPeople.count - 8) }
     }
 
     func kind(of row: [String: Any]) -> RowKind {
@@ -411,6 +810,10 @@ final class DeskModel: ObservableObject {
         return .unknown
     }
 
+    func confirm(_ write: PendingWrite) {
+        pending = write
+    }
+
     func confirm(_ title: String, _ detail: String, button: String, run: @escaping () async -> Void) {
         pending = PendingWrite(title: title, detail: detail, button: button, run: run)
     }
@@ -422,9 +825,22 @@ final class DeskModel: ObservableObject {
             "last_name": draftLast.trimmingCharacters(in: .whitespaces),
             "phone": draftPhone.trimmingCharacters(in: .whitespaces),
         ]
-        confirm("Save this person?", "Updates the name and phone for \(JSON.string(selected["email"])).", button: "Save") {
-            await self.writePerson(id: id, body: body)
+        var points: [String] = []
+        func change(_ label: String, _ old: String, _ new: String) {
+            guard old != new else { return }
+            points.append("\(label): \(old.ifEmpty("blank")) → \(new.ifEmpty("blank"))")
         }
+        change("First name", JSON.string(selected["first_name"]), body["first_name"] as? String ?? "")
+        change("Last name", JSON.string(selected["last_name"]), body["last_name"] as? String ?? "")
+        change("Phone", JSON.string(selected["phone"]), body["phone"] as? String ?? "")
+        confirm(PendingWrite(
+            title: "Save changes to \(JSON.string(selected["email"]).ifEmpty("this person"))?",
+            detail: "Updates their record in Feathr. Nothing is emailed to them.",
+            button: "Save",
+            points: points
+        ) {
+            await self.writePerson(id: id, body: body)
+        })
     }
 
     func createPerson() {
@@ -445,7 +861,7 @@ final class DeskModel: ObservableObject {
             errorText = "\(JSON.string(selected["email"])) already has \(tagName(tagID))."
             return
         }
-        confirm("Add \(tagName(tagID))?", "Tags \(JSON.string(selected["email"])).", button: "Add tag") {
+        confirm("Add \(tagName(tagID))?", "Tags \(JSON.string(selected["email"])). Nothing is emailed to them.", button: "Add tag") {
             await self.addTag(personID: personID, tagID: tagID)
         }
     }
@@ -454,13 +870,18 @@ final class DeskModel: ObservableObject {
         guard let personID = selected["id"] as? String, canWriteTags, canWritePeople else { return }
         let email = JSON.string(selected["email"])
         let remaining = JSON.tagIDs(selected).filter { $0 != tagID }
-        confirm(
-            "Remove \(tagName(tagID))?",
-            "Takes the tag off \(email). The tag itself stays, and everyone else keeps it. The desk checks afterward that Feathr actually removed it.",
-            button: "Remove tag"
+        confirm(PendingWrite(
+            title: "Remove \(tagName(tagID))?",
+            detail: "Takes the tag off \(email).",
+            button: "Remove tag",
+            tone: .caution,
+            points: [
+                "The tag itself stays, and everyone else keeps it.",
+                "Desk re-reads the person afterward and tells you if Feathr kept the tag.",
+            ]
         ) {
             await self.removeTagNow(personID: personID, tagID: tagID, remaining: remaining)
-        }
+        })
     }
 
     // MARK: - Tags and webhooks
@@ -488,24 +909,56 @@ final class DeskModel: ObservableObject {
 
     func setWebhookActive(_ hook: [String: Any], active: Bool) {
         guard canWriteHooks, let id = hook["id"] as? String else { return }
-        let name = JSON.string(hook["name"])
-        let detail = active
-            ? "Feathr will start sending people to the website again. Leave it off if those deliveries are still failing."
-            : "Feathr will stop sending people to Salesforce until you turn it back on."
-        confirm(active ? "Turn sync back on?" : "Pause Salesforce sync?", detail, button: active ? "Turn on" : "Pause") {
-            await self.patchWebhook(id: id, active: active, name: name, url: JSON.string(hook["target_url"]), events: JSON.strings(hook["events"]))
+        let name = Plain.hookTitle(hook)
+        let destination = Plain.destination(hook)
+        let events = Plain.hookEvents(hook).lowercased().ifEmpty("people")
+        let streak = JSON.int(hook["consecutive_failures"])
+        let problem = Plain.hookProblem(JSON.string(hook["last_error"]))?.summary
+        let catchUp = "Desk cannot tell whether Feathr re-sends changes made while it was paused. Spot-check \(destination) afterward."
+        let write: PendingWrite
+        if active {
+            var points = ["Feathr starts sending \(events) to \(destination) again."]
+            if streak > 0 {
+                points.append("The last \(Human.plural(streak, "delivery", "deliveries")) failed.\(problem.map { " \($0)" } ?? "") If that is not fixed, the failures will continue.")
+            }
+            points.append(catchUp)
+            write = PendingWrite(
+                title: "Turn \(name) back on?",
+                detail: "Sync has been paused. Turning it on affects every new and updated person from now on.",
+                button: "Turn on",
+                tone: streak > 0 ? .caution : .standard,
+                points: points,
+                acknowledge: streak > 0 ? "The receiving side is fixed, or I am watching the next deliveries." : nil
+            ) {
+                await self.patchWebhook(id: id, active: true, hook: hook)
+            }
+        } else {
+            write = PendingWrite(
+                title: "Pause \(name)?",
+                detail: "While paused, Feathr stops sending \(events) to \(destination) until someone turns it back on.",
+                button: "Pause sync",
+                tone: .caution,
+                points: [
+                    "Nothing already in \(destination) changes.",
+                    catchUp,
+                ],
+                acknowledge: "I understand people will not reach \(destination) while this is paused."
+            ) {
+                await self.patchWebhook(id: id, active: false, hook: hook)
+            }
         }
+        confirm(write)
     }
 
     // MARK: - Lookups
 
     func tagName(_ id: String) -> String {
-        tags.first { JSON.string($0["id"]) == id }.map { JSON.string($0["name"]) } ?? id
+        tags.first { JSON.string($0["id"]) == id }.map { JSON.string($0["name"]) } ?? "Tag …\(id.suffix(6))"
     }
 
     func projectName(_ id: String) -> String {
         guard !id.isEmpty else { return "—" }
-        return projects.first { JSON.string($0["id"]) == id }.map { JSON.string($0["name"]) } ?? String(id.suffix(6))
+        return projects.first { JSON.string($0["id"]) == id }.map { JSON.string($0["name"]) } ?? "Project …\(id.suffix(6))"
     }
 
     func campaignName(_ id: String) -> String {
@@ -514,194 +967,368 @@ final class DeskModel: ObservableObject {
     }
 
     func fieldLabel(_ key: String) -> String {
+        fieldDefinition(key).map { JSON.string($0["label"]).ifEmpty(key) } ?? key
+    }
+
+    func fieldDefinition(_ key: String) -> [String: Any]? {
         fields.first { JSON.string($0["key"]) == key || JSON.string($0["id"]) == key }
-            .map { JSON.string($0["label"]).ifEmpty(key) } ?? key
     }
 
     /// Custom field values on a person, in label order. Only fields Feathr actually returned.
-    func customFieldRows(_ person: [String: Any]) -> [(label: String, value: String)] {
+    func customFieldRows(_ person: [String: Any]) -> [(key: String, label: String, value: String)] {
         let values = JSON.object(person["custom_fields"])
-        return values.compactMap { key, value -> (String, String)? in
+        return values.compactMap { key, value -> (String, String, String)? in
             let text = JSON.display(value)
-            return text.isEmpty ? nil : (fieldLabel(key), text)
+            return text.isEmpty ? nil : (key, fieldLabel(key), text)
         }
-        .sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
+        .sorted { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
     }
 
     var campaignStates: [String] { Array(Set(campaigns.map { JSON.string($0["state"]) }.filter { !$0.isEmpty })).sorted() }
     var campaignKinds: [String] { Array(Set(campaigns.map { JSON.string($0["kind"]) }.filter { !$0.isEmpty })).sorted() }
 
-    func campaignCount(state: String? = nil, kind: String? = nil) -> Int {
+    /// Projects that own at least one loaded campaign, by name.
+    var campaignProjects: [(id: String, name: String)] {
+        Array(Set(campaigns.map { JSON.string($0["project_id"]) }.filter { !$0.isEmpty }))
+            .map { ($0, projectName($0)) }
+            .sorted { $0.1.localizedCaseInsensitiveCompare($1.1) == .orderedAscending }
+    }
+
+    func campaignCount(state: String? = nil, kind: String? = nil, project: String? = nil) -> Int {
         campaigns.filter { row in
-            (state == nil || JSON.string(row["state"]) == state) && (kind == nil || JSON.string(row["kind"]) == kind)
+            (state == nil || JSON.string(row["state"]) == state)
+                && (kind == nil || JSON.string(row["kind"]) == kind)
+                && (project == nil || JSON.string(row["project_id"]) == project)
         }.count
+    }
+
+    var campaignFiltering: Bool {
+        !campaignState.isEmpty || !campaignKind.isEmpty || !campaignProject.isEmpty || !campaignQuery.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    func clearCampaignFilters() {
+        campaignState = ""
+        campaignKind = ""
+        campaignProject = ""
+        campaignQuery = ""
     }
 
     var filteredCampaigns: [[String: Any]] {
         let q = campaignQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return campaigns
+        let rows = campaigns
             .filter { campaignState.isEmpty || JSON.string($0["state"]) == campaignState }
             .filter { campaignKind.isEmpty || JSON.string($0["kind"]) == campaignKind }
+            .filter { campaignProject.isEmpty || JSON.string($0["project_id"]) == campaignProject }
             .filter { q.isEmpty || JSON.string($0["name"]).lowercased().contains(q) || projectName(JSON.string($0["project_id"])).lowercased().contains(q) }
-            .sorted { JSON.string($0["name"]).localizedCaseInsensitiveCompare(JSON.string($1["name"])) == .orderedAscending }
+        switch campaignSort {
+        case .name:
+            return Self.byName(rows)
+        case .newest:
+            return rows.sorted {
+                (JSON.date(JSON.string($0["date_start"])) ?? .distantPast) > (JSON.date(JSON.string($1["date_start"])) ?? .distantPast)
+            }
+        }
+    }
+
+    var filteredTags: [[String: Any]] {
+        let q = tagQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return tags }
+        return tags.filter { JSON.string($0["name"]).localizedCaseInsensitiveContains(q) }
+    }
+
+    func campaignsInProject(_ id: String) -> Int {
+        campaigns.filter { JSON.string($0["project_id"]) == id }.count
+    }
+
+    /// The Salesforce link if there is one, otherwise the first webhook.
+    var primaryHook: [String: Any]? {
+        webhooks.first(where: Plain.isSalesforce) ?? webhooks.first
     }
 
     var syncHealth: SyncHealth {
-        guard let hook = webhooks.first(where: { JSON.string($0["target_url"]).localizedCaseInsensitiveContains("salesforce") }) ?? webhooks.first else {
+        guard let hook = primaryHook else {
+            if !connected {
+                return SyncHealth(level: .none, headline: "Checking sync…", detail: "", hook: nil)
+            }
             return SyncHealth(level: .none, headline: "No Salesforce sync link", detail: connected ? "Feathr has no webhook set up on this account, so people are not sent to Salesforce automatically." : "Connect a key to check sync.", hook: nil)
         }
-        let active = JSON.bool(hook["is_active"]) == true
-        let streak = JSON.int(hook["consecutive_failures"])
-        let lastTry = JSON.string(hook["last_delivery_at"])
-        let when = lastTry.isEmpty ? "" : " Last attempt \(JSON.relative(lastTry))."
-        if !active {
-            let why = streak > 0 ? "It stopped after \(streak) deliveries in a row could not reach the website." : "People are not being sent to Salesforce right now."
-            return SyncHealth(level: .problem, headline: "Salesforce sync is paused", detail: why + when, hook: hook)
-        }
-        if streak > 0 {
-            return SyncHealth(level: .warning, headline: "Salesforce sync is on, but failing", detail: "The last \(streak) deliver\(streak == 1 ? "y" : "ies") could not reach the website.\(when)", hook: hook)
-        }
-        return SyncHealth(level: .good, headline: "Salesforce sync is on", detail: "New and updated people are being sent to Salesforce.\(when)", hook: hook)
+        return SyncHealth.of(hook)
     }
+
+    var giftsToday: Int {
+        recentGifts.filter { JSON.date(JSON.string($0["created_at"])).map(Calendar.current.isDateInToday) ?? false }.count
+    }
+
+    var latestGiftDate: Date? {
+        recentGifts.compactMap { JSON.date(JSON.string($0["created_at"])) }.max()
+    }
+
+    /// Short, grounded list of things worth a look. Empty means nothing needs the operator.
+    var nextActions: [NextAction] {
+        var list: [NextAction] = []
+        if phase == .keyRejected {
+            list.append(NextAction(id: "key", symbol: "key", title: "Replace the Feathr key", detail: "Feathr stopped accepting the current key.", level: .problem) { [weak self] in
+                self?.showKeySheet = true
+            })
+        }
+        for hook in webhooks {
+            let health = SyncHealth.of(hook)
+            guard health.level == .problem || health.level == .warning else { continue }
+            list.append(NextAction(id: "hook-\(JSON.string(hook["id"]))", symbol: "arrow.left.arrow.right", title: health.headline, detail: health.detail, level: health.level) { [weak self] in
+                self?.go(.webhooks)
+                self?.select(hook)
+            })
+        }
+        if !listProblems.isEmpty {
+            list.append(NextAction(id: "lists", symbol: "exclamationmark.triangle", title: "Some lists did not load", detail: listProblems.joined(separator: " · "), level: .warning) { [weak self] in
+                Task { await self?.refreshAll() }
+            })
+        }
+        if rateLow, let remaining = rateRemaining {
+            list.append(NextAction(id: "rate", symbol: "gauge.with.dots.needle.33percent", title: "Feathr requests are running low", detail: "\(Human.count(remaining)) left in this window. Desk will wait if Feathr asks it to.", level: .warning) {})
+        }
+        if let last = lastRefresh, Date().timeIntervalSince(last) > 30 * 60 {
+            list.append(NextAction(id: "stale", symbol: "clock.arrow.circlepath", title: "Desk was last refreshed \(Human.relative(last))", detail: "Refresh to see the latest from Feathr.") { [weak self] in
+                Task { await self?.refreshAll() }
+            })
+        }
+        if giftsToday > 0 {
+            list.append(NextAction(id: "gifts", symbol: "gift", title: giftsToday >= Self.recentGiftCount ? "Gifts came in today" : "\(Human.plural(giftsToday, "gift")) today", detail: "Open Activity to see who gave.") { [weak self] in
+                self?.showActivity(flavor: ActivityKind.donation.flavor)
+            })
+        }
+        let sending = campaignCount(state: "published")
+        if sending > 0 {
+            list.append(NextAction(id: "sending", symbol: "envelope", title: "\(Human.plural(sending, "campaign")) sending", detail: "Look over what is going out this week.") { [weak self] in
+                self?.showCampaigns(state: "published")
+            })
+        }
+        return list
+    }
+
+    func showCampaigns(state: String) {
+        clearCampaignFilters()
+        campaignState = state
+        go(.campaigns)
+    }
+
+    // MARK: - Navigation
 
     func requestFocus(_ target: DeskSection? = nil) {
         let destination = target ?? (section.hasSearch ? section : .people)
-        if section != destination {
-            section = destination
-            selected = [:]
-        }
+        go(destination)
         focusRequest = destination
     }
 
     func go(_ destination: DeskSection) {
+        guard destination != section else { return }
         section = destination
         selected = [:]
+    }
+
+    func goBack() {
+        guard let previous = history.popLast() else { return }
+        navigatingBack = true
+        section = previous
+        selected = [:]
+    }
+
+    func toggleSidebar() {
+        withAnimation(.easeInOut(duration: 0.18)) { sidebarCollapsed.toggle() }
+    }
+
+    func openPalette() {
+        paletteQuery = ""
+        paletteIndex = 0
+        paletteOpen = true
+    }
+
+    func closePalette() {
+        paletteOpen = false
+    }
+
+    /// Rows in the open section, in on-screen order, for ↑/↓ navigation.
+    var visibleRows: [[String: Any]] {
+        switch section {
+        case .desk: return recentGifts
+        case .people: return people
+        case .tags: return filteredTags
+        case .campaigns: return filteredCampaigns
+        case .projects: return projects
+        case .activity: return crumbs
+        case .fields: return fields
+        case .webhooks: return webhooks
+        }
+    }
+
+    func moveSelection(_ step: Int) {
+        let rows = visibleRows
+        guard !rows.isEmpty else { return }
+        let current = JSON.string(selected["id"])
+        let index = rows.firstIndex { !current.isEmpty && $0.selfID == current } ?? (step > 0 ? -1 : rows.count)
+        let next = min(max(index + step, 0), rows.count - 1)
+        select(rows[next])
+        if section == .activity, next >= rows.count - 3 { loadMoreActivity() }
+    }
+
+    /// Return or ⌘O on a selected row.
+    func activateSelection() {
+        switch kind(of: selected) {
+        case .crumb:
+            let row = selected
+            Task { await openPerson(from: row) }
+        case .person where section != .people:
+            let row = selected
+            people = [row]
+            peopleMatchTotal = 1
+            personQuery = JSON.string(row["email"])
+            peopleQueryRan = personQuery
+            section = .people
+            select(row)
+        default:
+            break
+        }
     }
 
     // MARK: - Writes
 
     private func writePerson(id: String, body: [String: Any]) async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let updated = try await api.send("PATCH", "/persons/\(id)", body: body)
-            replacePerson(updated, id: id)
-            fillDrafts()
-            note("Saved person \(JSON.string(updated["email"])).")
-        } catch {
-            errorText = error.localizedDescription
+        await working {
+            do {
+                var updated = try await api.send("PATCH", "/persons/\(id)", body: body)
+                if updated.isEmpty { updated = try await api.get("/persons/\(id)") }
+                replacePerson(updated, id: id)
+                fillDrafts()
+                note("Saved \(JSON.string(selected["email"]).ifEmpty("person")).")
+            } catch {
+                report(error)
+            }
         }
     }
 
     private func createPersonNow(email: String) async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            var body: [String: Any] = ["email": email]
-            if !createFirst.trimmingCharacters(in: .whitespaces).isEmpty { body["first_name"] = createFirst.trimmingCharacters(in: .whitespaces) }
-            if !createLast.trimmingCharacters(in: .whitespaces).isEmpty { body["last_name"] = createLast.trimmingCharacters(in: .whitespaces) }
-            if !createPhone.trimmingCharacters(in: .whitespaces).isEmpty { body["phone"] = createPhone.trimmingCharacters(in: .whitespaces) }
-            let created = try await api.send("POST", "/persons", body: body)
-            people = [created]
-            selected = created
-            personQuery = email
-            draftEmail = ""
-            createFirst = ""
-            createLast = ""
-            createPhone = ""
-            fillDrafts()
-            note("Created \(email).")
-        } catch {
-            errorText = error.localizedDescription
+        await working {
+            do {
+                var body: [String: Any] = ["email": email]
+                let first = createFirst.trimmingCharacters(in: .whitespaces)
+                let last = createLast.trimmingCharacters(in: .whitespaces)
+                let phone = createPhone.trimmingCharacters(in: .whitespaces)
+                if !first.isEmpty { body["first_name"] = first }
+                if !last.isEmpty { body["last_name"] = last }
+                if !phone.isEmpty { body["phone"] = phone }
+                let created = try await api.send("POST", "/persons", body: body)
+                people = [created]
+                peopleMatchTotal = 1
+                personQuery = email
+                peopleQueryRan = email
+                draftEmail = ""
+                createFirst = ""
+                createLast = ""
+                createPhone = ""
+                showCreatePerson = false
+                select(created)
+                note("Created \(email).")
+            } catch {
+                report(error)
+            }
         }
     }
 
     private func addTag(personID: String, tagID: String) async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            _ = try await api.send("POST", "/persons/\(personID)/tags", body: ["tag_ids": [tagID]])
-            let updated = try await api.get("/persons/\(personID)")
-            replacePerson(updated, id: personID)
-            note("Tagged \(JSON.string(updated["email"])) with \(tagName(tagID)).")
-        } catch {
-            errorText = error.localizedDescription
+        await working {
+            do {
+                _ = try await api.send("POST", "/persons/\(personID)/tags", body: ["tag_ids": [tagID]])
+                let updated = try await api.get("/persons/\(personID)")
+                replacePerson(updated, id: personID)
+                note("Tagged \(JSON.string(updated["email"])) with \(tagName(tagID)).")
+            } catch {
+                report(error)
+            }
         }
     }
 
     private func removeTagNow(personID: String, tagID: String, remaining: [String]) async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            _ = try await api.send("PATCH", "/persons/\(personID)", body: ["tag_ids": remaining])
-            let updated = try await api.get("/persons/\(personID)")
-            replacePerson(updated, id: personID)
-            if JSON.tagIDs(updated).contains(tagID) {
-                errorText = "Feathr accepted the request but kept \(tagName(tagID)) on this person. The API may not support removing tags yet. Remove it in Feathr instead."
-                note("Tag \(tagName(tagID)) is still on \(JSON.string(updated["email"])).")
-            } else {
-                note("Removed \(tagName(tagID)) from \(JSON.string(updated["email"])).")
+        await working {
+            do {
+                _ = try await api.send("PATCH", "/persons/\(personID)", body: ["tag_ids": remaining])
+                let updated = try await api.get("/persons/\(personID)")
+                replacePerson(updated, id: personID)
+                if JSON.tagIDs(updated).contains(tagID) {
+                    errorText = "Feathr accepted the request but kept \(tagName(tagID)) on this person. The API may not support removing tags yet. Remove it in Feathr instead."
+                    note("Tag \(tagName(tagID)) is still on \(JSON.string(updated["email"])).")
+                } else {
+                    note("Removed \(tagName(tagID)) from \(JSON.string(updated["email"])).")
+                }
+            } catch {
+                report(error)
             }
-        } catch {
-            errorText = error.localizedDescription
         }
     }
 
     private func createTagNow(_ name: String) async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let created = try await api.send("POST", "/tags", body: ["name": name, "context": "person"])
-            tags.insert(created, at: 0)
-            tags.sort { JSON.string($0["name"]).localizedCaseInsensitiveCompare(JSON.string($1["name"])) == .orderedAscending }
-            selected = created
-            newTagName = ""
-            renameTag = name
-            note("Created tag \(name).")
-        } catch {
-            errorText = error.localizedDescription
+        await working {
+            do {
+                let created = try await api.send("POST", "/tags", body: ["name": name, "context": "person"])
+                tags = Self.byName(tags + [created])
+                selected = created
+                newTagName = ""
+                renameTag = name
+                note("Created tag \(name).")
+            } catch {
+                report(error)
+            }
         }
     }
 
     private func renameTagNow(id: String, name: String) async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let updated = try await api.send("PATCH", "/tags/\(id)", body: ["name": name])
-            if let index = tags.firstIndex(where: { JSON.string($0["id"]) == id }) {
-                tags[index] = updated
+        await working {
+            do {
+                let updated = try await api.send("PATCH", "/tags/\(id)", body: ["name": name])
+                if let index = tags.firstIndex(where: { JSON.string($0["id"]) == id }) {
+                    tags[index] = updated
+                }
+                tags = Self.byName(tags)
+                selected = updated
+                note("Renamed tag to \(name).")
+            } catch {
+                report(error)
             }
-            selected = updated
-            note("Renamed tag to \(name).")
-        } catch {
-            errorText = error.localizedDescription
         }
     }
 
-    private func patchWebhook(id: String, active: Bool, name: String, url: String, events: [String]) async {
+    private func patchWebhook(id: String, active: Bool, hook: [String: Any]) async {
         guard let api else { return }
-        busy = true
-        defer { busy = false }
-        do {
-            let updated = try await api.send("PATCH", "/webhooks/\(id)", body: [
-                "name": name,
-                "target_url": url,
-                "events": events,
-                "is_active": active,
-            ])
-            if let index = webhooks.firstIndex(where: { JSON.string($0["id"]) == id }) {
-                webhooks[index] = updated
+        let name = Plain.hookTitle(hook)
+        await working {
+            do {
+                let updated = try await api.send("PATCH", "/webhooks/\(id)", body: [
+                    "name": JSON.string(hook["name"]),
+                    "target_url": JSON.string(hook["target_url"]),
+                    "events": JSON.strings(hook["events"]),
+                    "is_active": active,
+                ])
+                if let fresh = try? await api.paginate("/webhooks", pageSize: 50, maxPages: 2).items {
+                    webhooks = fresh
+                } else if let index = webhooks.firstIndex(where: { JSON.string($0["id"]) == id }), !updated.isEmpty {
+                    webhooks[index] = updated
+                }
+                if let current = webhooks.first(where: { JSON.string($0["id"]) == id }) {
+                    selected = current
+                    if (JSON.bool(current["is_active"]) == true) != active {
+                        errorText = "Feathr accepted the change, but \(name) still reads as \(active ? "paused" : "running"). Check it in Feathr."
+                        return
+                    }
+                }
+                note(active ? "Turned \(name) on." : "Paused \(name).")
+            } catch {
+                report(error)
             }
-            selected = updated
-            note(active ? "Turned \(name) on." : "Paused \(name).")
-        } catch {
-            errorText = error.localizedDescription
         }
     }
 
@@ -712,21 +1339,25 @@ final class DeskModel: ObservableObject {
         if let index = people.firstIndex(where: { JSON.string($0["id"]) == id }) {
             people[index] = updated
         }
+        if let index = recentPeople.firstIndex(where: { JSON.string($0["id"]) == id }) {
+            recentPeople[index] = updated
+        }
     }
 
     private func fillDrafts() {
         draftFirst = JSON.string(selected["first_name"])
         draftLast = JSON.string(selected["last_name"])
         draftPhone = JSON.string(selected["phone"])
-        if tagToApply.isEmpty || !tags.contains(where: { JSON.string($0["id"]) == tagToApply }) {
-            tagToApply = tags.first.map { JSON.string($0["id"]) } ?? ""
+        let have = Set(JSON.tagIDs(selected))
+        if tagToApply.isEmpty || have.contains(tagToApply) || !tags.contains(where: { JSON.string($0["id"]) == tagToApply }) {
+            tagToApply = tags.first { !have.contains(JSON.string($0["id"])) }.map { JSON.string($0["id"]) } ?? ""
         }
     }
 
     private func reselect() {
         let id = JSON.string(selected["id"])
         guard !id.isEmpty else { return }
-        let pools = [people, tags, campaigns, projects, fields, webhooks, crumbs]
+        let pools = [people, tags, campaigns, projects, fields, webhooks, crumbs, recentGifts]
         if let match = pools.lazy.compactMap({ pool in pool.first { JSON.string($0["id"]) == id } }).first {
             selected = match
         }

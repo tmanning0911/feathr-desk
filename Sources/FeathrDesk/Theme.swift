@@ -7,6 +7,11 @@ enum DeskTheme {
     static let desk = Color(red: 0.11, green: 0.10, blue: 0.09)
     static let rail = Color(red: 0.08, green: 0.07, blue: 0.065)
     static let paper = Color(red: 0.145, green: 0.13, blue: 0.12)
+    static let raised = Color(red: 0.17, green: 0.155, blue: 0.14)
+    static let line = Color.white.opacity(0.07)
+    static let good = Color(red: 0.49, green: 0.76, blue: 0.56)
+    static let warn = Color(red: 0.95, green: 0.69, blue: 0.38)
+    static let problem = Color(red: 0.90, green: 0.43, blue: 0.33)
 }
 
 struct DeskBadge: View {
@@ -26,6 +31,7 @@ struct CopperButton: View {
     var systemImage: String? = nil
     var enabled: Bool = true
     let action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
@@ -36,21 +42,26 @@ struct CopperButton: View {
                 Text(title)
             }
             .font(.system(size: 13, weight: .semibold, design: .rounded))
-            .foregroundStyle(DeskTheme.ink)
+            .foregroundStyle(DeskTheme.ink.opacity(enabled ? 1 : 0.6))
             .padding(.horizontal, 14)
             .padding(.vertical, 7)
-            .background(enabled ? DeskTheme.copper : DeskTheme.copper.opacity(0.35))
+            .background(enabled ? (hovering ? DeskTheme.copperHighlight : DeskTheme.copper) : DeskTheme.copper.opacity(0.35))
             .clipShape(Capsule())
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
 
 struct QuietButton: View {
     let title: String
     var systemImage: String? = nil
+    var enabled: Bool = true
     let action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
@@ -61,13 +72,17 @@ struct QuietButton: View {
                 Text(title)
             }
             .font(.system(size: 12, weight: .medium, design: .rounded))
-            .foregroundStyle(.white.opacity(0.82))
+            .foregroundStyle(.white.opacity(enabled ? 0.85 : 0.35))
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(Color.white.opacity(0.08))
+            .background(Color.white.opacity(hovering && enabled ? 0.13 : 0.08))
             .clipShape(Capsule())
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .disabled(!enabled)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
     }
 }
 
